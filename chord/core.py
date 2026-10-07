@@ -51,7 +51,7 @@ class ChordRing:
         if not text:
             raise ChordError("键不能是空字符串")
         digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        return int(digest, 16) % (self.size - 1)
+        return int(digest, 16) % self.size
 
     def node_ids(self):
         """按编号升序返回环上所有节点。"""
@@ -88,11 +88,11 @@ class ChordRing:
 
     # ------------------------------------------------------------- 区间判定
     def _in_interval(self, position, start, end):
-        """判断 position 是否落在环上从 start 顺时针到 end 的区间内。"""
+        """判断 position 是否落在环上 (start, end] 区间内。"""
         if start < end:
-            return start <= position <= end
+            return start < position <= end
         if start > end:
-            return position >= start or position <= end
+            return position > start or position <= end
         return True
 
     def owns(self, node_id, key_id):
@@ -125,7 +125,7 @@ class ChordRing:
         """重算 node_id 的 finger 表。"""
         table = []
         for index in range(self.bits):
-            offset = 1 << (index + 1)
+            offset = 1 << index
             position = (node_id + offset) % self.size
             table.append(self._closest_successor(position, node_id))
         self.nodes[node_id].fingers = table
@@ -139,11 +139,18 @@ class ChordRing:
         self._require_node(node_id)
         self._require_position(target, "目标位置")
         best = None
+        best_distance = -1
         for finger in self.fingers_of(node_id):
             if finger is None:
                 continue
-            if finger <= target:
+            if finger == node_id:
+                continue
+            if not self._in_interval(finger, node_id, target):
+                continue
+            distance = self._distance(node_id, finger)
+            if distance > best_distance:
                 best = finger
+                best_distance = distance
         return best
 
     # ------------------------------------------------------------- 查找
@@ -182,9 +189,6 @@ class ChordRing:
     # ------------------------------------------------------------- 键值数据
     def _holder_chain(self, owner_id):
         """从归属节点出发沿后继方向取互不相同的副本节点。"""
-        if len(self.nodes) == 1:
-            # 环上只有一个节点，没有其它节点可以放副本
-            return []
         chain = []
         current = owner_id
         while len(chain) < self.replicas and current is not None and current not in chain:
@@ -248,10 +252,8 @@ class ChordRing:
         node.predecessor = pred
         self.nodes[pred].successor = node_id
         self.nodes[succ].predecessor = node_id
-        moved = dict(self.holdings[pred])
-        moved.update(self.holdings[succ])
-        self._rebuild_fingers(node_id)
-        self._relocate(moved)
+        self._rebuild_all_fingers()
+        self._redistribute()
         return node_id
 
     def remove_node(self, node_id):
@@ -270,14 +272,22 @@ class ChordRing:
         self.nodes[succ].predecessor = pred
         del self.nodes[node_id]
         keys = self.holdings.pop(node_id)
-        self.holdings[pred].update(keys)
+        self.holdings[succ].update(keys)
         self._rebuild_all_fingers()
+        self._redistribute()
         return node_id
 
-    def _relocate(self, keys):
-        """按当前环结构重新摆放给定的键。"""
-        for key_id, value in sorted(keys.items()):
+    def _redistribute(self):
+        """环结构变化后，把所有键重新对齐到归属节点与副本节点。"""
+        pairs = {}
+        for node_id in self.node_ids():
+            data = self.holdings[node_id]
+            for key_id, value in data.items():
+                pairs[key_id] = value
+            data.clear()
+        for key_id, value in sorted(pairs.items()):
             owner = self.lookup(key_id)
             if owner is None:
                 continue
-            self.holdings[owner][key_id] = value
+            for holder in self._holder_chain(owner):
+                self.holdings[holder][key_id] = value
